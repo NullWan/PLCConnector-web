@@ -4,7 +4,7 @@
       <div class="content-container">
         <t-row>
           <t-form :data="formData" ref="form"
-                  @reset="onReset" @submit="onSubmit"
+                  @reset="onReset" @submit="handleServerSearch"
                   layout="inline" label-align="top">
             <t-tooltip content="OPC DA服务器的IP地址">
               <t-form-item label="服务器地址:" name="host" :rules="[{ required: true, message: '请输入服务器地址' }]">
@@ -45,11 +45,11 @@
                 <t-select v-model="selectData" :options="selectOptions" :disabled="selectIsDisabled"
                           placeholder="请选择OPC DA服务器"/>
               </t-tooltip>
-              <t-button theme="primary" variant="base" :disabled="connectState" @click="connect()">
+              <t-button theme="primary" variant="base" :disabled="isConnected" @click="connect()">
                 连接
               </t-button>
 
-              <t-button theme="danger" variant="base" :disabled="!connectState" @click="disconnect()">
+              <t-button theme="danger" variant="base" :disabled="!isConnected" @click="disconnect()">
                 断开
               </t-button>
             </t-space>
@@ -57,25 +57,23 @@
           <t-col :span="4">
             <t-space align="center">
               <label>刷新速率：</label>
-              <t-select :auto-width="true" v-model="refreshRate" :disabled="!connectState">
-                <t-option label="500ms" value="500"></t-option>
-                <t-option label="1s" value="1000"></t-option>
-                <t-option label="2s" value="2000"></t-option>
-                <t-option label="3s" value="3000"></t-option>
+              <t-select :auto-width="true" v-model="refreshRate" :disabled="!isConnected">
+                <t-option :label="item.label" :value="item.value" v-for="(item, index) in initRefreshRate"
+                          :key="index"></t-option>
               </t-select>
               <label>实时数据：</label>
               <t-tooltip content="读取选中数据点实时数据">
-                <t-switch size="large" :label="['开', '关']" :disabled="!connectState" @change="read"
-                :value="switchValue"></t-switch>
+                <t-switch size="large" :label="['开', '关']" :disabled="!isConnected" @change="toggleDataStream"
+                          :value="connectionState.isDataStreamActive"></t-switch>
               </t-tooltip>
             </t-space>
           </t-col>
           <t-col :span="2" :offset="2">
             <t-space :size="4">
               <label>连接状态：</label>
-              <span :style="{color: this.connectState ? 'green' : '#d54941'}" :class="iconfont"></span>
-              <t-tag :theme="this.connectState ? 'success' : 'danger'" variant="light">
-                {{ this.connectState ? '已连接' : '未连接' }}
+              <span :style="{color: statusColor}" :class="statusIcon"></span>
+              <t-tag :theme="stateTheme" variant="light">
+                {{ connectionStatus }}
               </t-tag>
             </t-space>
           </t-col>
@@ -93,7 +91,7 @@
               :checkStrictly="true"
               :checkable="true"
               v-model="treeSelectedNode"
-              @click="addItem"
+              @click="handleTreeNodeClick"
             />
           </t-col>
           <t-col :span="8">
@@ -111,7 +109,8 @@
 <script>
 
 import OnLineCard from '@/pages/plcConnector/opc/da/component/onLineCard/index.vue';
-import {v4 as uuidV4} from 'uuid';
+import {Client, ActivationState} from '@stomp/stompjs';
+import Fingerprint from '@fingerprintjs/fingerprintjs';
 
 const INITIAL_DATA = {
   host: "192.168.134.130",
@@ -119,11 +118,12 @@ const INITIAL_DATA = {
   password: "8ik,9ol.",
 }
 
-const clientIdUUID = uuidV4();
-
-let webSocket = {};
-
-let isWebSocketOpen = false;
+const REFRESH_RATE_OPTIONS = [
+  {label: "500ms", value: "500"},
+  {label: "1s", value: "1000"},
+  {label: "2s", value: "2000"},
+  {label: "3s", value: "3000"}
+]
 
 export default {
   name: 'OpcDa',
@@ -137,145 +137,222 @@ export default {
       selectIsDisabled: true,
       findServerListLoading: false,
       items: [],
-      connectState: false,
       refreshRate: '1000',
-      iconfont: 'iconfont icon-duankailianjie',
       treeSelectedNode: [],
       dataArray: [],
       switchValue: false,
+      stompClient: null,
+      browserKey: null,
+      connectionState: {
+        isConnected: false,
+        isDataStreamActive: false
+      }
     }
   },
-  mounted() {
-    window.addEventListener('beforeunload', e => this.beforeunloadHandler(e))
+  computed: {
+    isConnected() {
+      return this.connectionState.isConnected
+    },
+    isDataStreamActive() {
+      return this.connectionState.isDataStreamActive
+    },
+    connectionStatus() {
+      return this.isConnected ? '已连接' : '未连接'
+    },
+    statusColor() {
+      return this.isConnected ? 'green' : '#d54941'
+    },
+    statusIcon() {
+      return this.isConnected
+        ? 'iconfont icon-lianjie'
+        : 'iconfont icon-duankailianjie'
+    },
+    stateTheme() {
+      return this.isConnected ? 'success' : 'danger'
+    },
+    initRefreshRate() {
+      return REFRESH_RATE_OPTIONS;
+    }
+  },
+  async created() {
+    await this.generateBrowserFingerprint()
   },
   beforeDestroy() {
-    // 在组件销毁前关闭 WebSocket 连接
-    if (this.webSocket && this.webSocket.readyState === WebSocket.OPEN) {
-      this.webSocket.close();
+    // 在组件销毁前,关闭STOMP连接
+    if (this.stompClient !== null && this.stompClient.state === ActivationState.ACTIVE) {
+      this.stompClient.deactivate();
     }
+    // 断开连接
+    this.disconnect();
   },
   methods: {
+    // 生成浏览器指纹
+    async generateBrowserFingerprint() {
+      try {
+        const fp = await Fingerprint.load()
+        const result = await fp.get()
+        this.browserKey = result.visitorId
+      } catch (error) {
+        console.error('生成浏览器指纹失败:', error)
+        // 降级方案：使用随机ID
+        this.browserKey = `fallback-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+      }
+    },
     onReset() {
       this.formData = INITIAL_DATA
     },
-    onSubmit({validateResult, firstError}) {
+    // 连接前验证
+    validateBeforeConnect() {
+      if (!this.isFindServerList) {
+        this.handleWarning("提示", "请先查找服务列表")
+        return false
+      }
+      if (!this.selectData) {
+        this.handleWarning("提示", "请先选择OPC DA服务器")
+        return false
+      }
+      return true
+    },
+    async handleServerSearch({validateResult, firstError}) {
       if (validateResult === true) {
         this.findServerListLoading = true;
-        this.$store.dispatch('opcConnection/getOPCDAServerList', this.formData).then(res => {
-          if (res.code === 200) {
-            this.$notify.success({title: "提示", content: `查找到${res.data.length}条服务`, closeBtn: true});
+        try {
+          const response = await this.$store.dispatch('opcConnection/getOPCDAServerList', this.formData);
+          if (response.code === 200) {
+            await this.$notify.success({title: "提示", content: `查找到${response.data.length}条服务`, closeBtn: true});
             this.isFindServerList = true;
-            if (res.data.length > 0) {
-              this.selectOptions = res.data;
-              this.selectIsDisabled = false;
-            }
+            this.selectOptions = response.data
+            this.selectIsDisabled = response.data.length === 0
           } else {
-            this.$notify.error({title: "连接出错", content: res.msg, closeBtn: true});
-            this.isFindServerList = false;
+            this.handleError("连接出错", response.msg);
           }
-        }).catch(err => {
-          this.$notify.error({title: "未知错误", content: err.message, closeBtn: true});
+        } catch (error) {
+          this.handleError("未知错误", error.message);
           this.isFindServerList = false;
-        }).finally(() => {
+        } finally {
           this.findServerListLoading = false;
-        })
+        }
       } else {
-        this.$notify.warning({title: "提示", content: firstError, closeBtn: true});
+        await this.$notify.warning({title: "提示", content: firstError, closeBtn: true});
       }
     },
-    connect() {
-      if (!this.isFindServerList) {
-        this.$notify.warning({title: "提示", content: "请先查找服务列表", closeBtn: true});
-        return;
-      }
-      if (this.selectData === '') {
-        this.$notify.warning({title: "提示", content: "请先选择OPC DA服务器", closeBtn: true});
-        return;
-      }
-      const serverInfo = this.getSerInfo();
-      this.$store.dispatch("opcConnection/connectServer", serverInfo).then(res => {
-        if (res.code === 200) {
-          this.$notify.success({title: "提示", content: "连接成功", closeBtn: true});
-          this.connectState = true;
-          this.iconfont = 'iconfont icon-lianjie';
-          this.items = res.data;
+    async connect() {
+      if (!this.validateBeforeConnect()) return;
+      try {
+        const serverInfo = this.getSerInfo();
+        const response = await this.$store.dispatch(
+          "opcConnection/connectServer",
+          serverInfo
+        )
+
+        if (response.code === 200) {
+          await this.$notify.success({title: "提示", content: "连接成功", closeBtn: true})
+          this.updateConnectionState({isConnected: true})
+          this.items = response.data
         } else {
-          this.$notify.error({title: "连接出错", content: res.msg, closeBtn: true});
-          this.connectState = false;
-          this.iconfont = 'iconfont icon-duankailianjie';
+          this.handleError("连接出错", response.msg)
+          this.updateConnectionState({isConnected: false})
         }
-      }).catch(err => {
-        this.$notify.error({title: "提示", content: err.message, closeBtn: true});
-        this.connectState = false;
-        this.iconfont = 'iconfont icon-duankailianjie';
-      });
+      } catch (error) {
+        this.handleError("连接错误", error.message)
+        this.updateConnectionState({isConnected: false})
+      }
     },
-    read(val) {
-      if (val) {
-        this.switchValue = true;
-        this.$store.dispatch("opcConnection/start").then(res => {
-          if (res.code !== 200) {
-            throw new Error(res.msg);
-          }
-          if (!isWebSocketOpen) {
-            webSocket = new WebSocket(`ws://localhost:8089/websocket/${clientIdUUID}`);
-          }
-          webSocket.onopen = () => {
-            isWebSocketOpen = true;
-            console.log('WebSocket connection opened.');
-          };
-
-          // 处理 WebSocket 错误事件
-          webSocket.onerror = (error) => {
-            console.error('WebSocket error:', error);
-          };
-
-          // 处理 WebSocket 关闭事件
-          webSocket.onclose = () => {
-            isWebSocketOpen = false;
-            console.log('WebSocket connection closed.');
-          };
-
-          // 处理 WebSocket 接收到的消息
-          webSocket.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            // 根据接收到的数据更新组件的状态
-            this.handleReceivedData(data);
-          };
-        }).catch(err => {
-          this.$notify.error({title: "提示", content: err.message, closeBtn: true});
-        })
+    // 切换数据流
+    async toggleDataStream(isActive) {
+      if (isActive) {
+        await this.startDataStream()
       } else {
-        this.switchValue = false;
-        // 关闭 WebSocket 连接
-        webSocket.close();
-        // 通知后端，暂停发送数据
-        this.$store.dispatch("opcConnection/stop", clientIdUUID).then(res => {
-          if (res.code !== 200) {
-            throw new Error(res.msg);
-          }
-        }).catch(err => {
-          this.$notify.error({title: "提示", content: err.message, closeBtn: true});
-        })
+        await this.stopDataStream()
       }
     },
-    addItem(obj) {
-      if (obj.node.data.checkable) {
-        const readData = {
-          refreshRate: this.refreshRate,
-          item: obj.node.value,
-          clientId: clientIdUUID
+    async startDataStream() {
+      this.setupStompClient();
+      try {
+        const response = await this.$store.dispatch(
+          "opcConnection/start",
+          this.browserKey
+        )
+        if (response.code === 200) {
+          this.updateConnectionState({isDataStreamActive: true})
+        } else {
+          this.updateConnectionState({isDataStreamActive: false})
+          this.handleError("提示", "数据推送失败！")
         }
-        this.$store.dispatch("opcConnection/read", readData).then(res => {
-          if (res.code === 200) {
-            console.log("添加点位成功..")
-          } else {
-            this.$notify.error({title: "提示", content: res.msg, closeBtn: true});
-          }
-        }).catch(err => {
-          this.$notify.error({title: "提示", content: err.message, closeBtn: true});
-        })
+      } catch (error) {
+        this.updateConnectionState({isDataStreamActive: false})
+        this.handleError("提示", "数据推送失败！")
+        console.error(error)
       }
+    },
+    // 停止数据流
+    async stopDataStream() {
+      try {
+        const response = await this.$store.dispatch(
+          "opcConnection/stop",
+          this.browserKey
+        )
+        if (response.code === 200) {
+          this.updateConnectionState({isDataStreamActive: false})
+          this.disconnectStompClient()
+        } else {
+          this.handleError("提示", "数据停止推送失败！")
+          console.error(response.msg)
+        }
+      } catch (error) {
+        this.handleError("提示", "数据停止推送失败！")
+        console.error(error)
+      }
+    },
+    disconnectStompClient() {
+      if (this.stompClient?.state === ActivationState.ACTIVE) {
+        this.stompClient.deactivate()
+      }
+      this.stompClient = null
+    },
+    // 设置STOMP客户端
+    setupStompClient() {
+      this.stompClient = new Client({
+        brokerURL: 'ws://localhost:8089/opc-websocket',
+        debug: (str) => console.log('STOMP: ', str),
+        onConnect: () => {
+          console.log('STOMP连接成功')
+          this.subscribeToDataTopic()
+        },
+        onStompError: (frame) => {
+          this.handleError("错误", 'STOMP组件初始化失败！')
+          console.error(frame)
+        },
+        onWebSocketError: (evt) => {
+          this.handleError("错误", '连接到WebSocket失败')
+          console.error(evt)
+        }
+      })
+      this.stompClient.activate()
+    },
+    handleTreeNodeClick(obj) {
+      if (!obj.node.data.checkable) return;
+      const operation = obj.node.checked ? "remove" : "add"
+      const payload = {
+        refreshRate: this.refreshRate,
+        item: obj.node.value,
+        clientId: this.browserKey
+      }
+
+      this.$store.dispatch(
+        `opcConnection/${operation}`,
+        payload
+      ).then(res => {
+        if (res.code === 200) {
+          console.log(`${operation === 'add' ? '添加' : '移除'}点位成功`)
+        } else {
+          this.handleError("提示", res.msg)
+        }
+      }).catch(error => {
+        this.handleError("提示", `${operation === 'add' ? '添加' : '移除'}点位失败！`)
+        console.error(error)
+      })
+
     },
     handleReceivedData(data) {
       // 更新 dataArray
@@ -289,19 +366,6 @@ export default {
         clsid: this.selectData,
       };
     },
-    beforeunloadHandler() {
-      if (webSocket && webSocket.readyState === WebSocket.OPEN) {
-        this.$store.dispatch("opcConnection/stop", clientIdUUID).then(res => {
-          if (res.code !== 200) {
-            this.$notify.error({title: "错误", content: "断开连接失败，请稍后再试", closeBtn: true});
-          } else if (isWebSocketOpen) {
-            webSocket.close();
-          }
-        }).catch(err => {
-          this.$notify.error({title: "错误", content: err.message, closeBtn: true});
-        })
-      }
-    },
     updateOrAddItem(array, item) {
       // 使用find查找数组中是否存在具有相同id的对象
       const existingItem = array.find(obj => obj.id === item.id);
@@ -314,23 +378,49 @@ export default {
       }
     },
     disconnect() {
-      this.$store.dispatch("opcConnection/stop", clientIdUUID).then(res => {
+      this.$store.dispatch("opcConnection/disconnect", this.browserKey).then(res => {
         if (res.code !== 200) {
           this.$notify.error({title: "错误", content: "断开连接失败，请稍后再试", closeBtn: true});
         } else {
-          if (isWebSocketOpen) {
-            webSocket.close();
+          if (this.stompClient !== null && this.stompClient.state === ActivationState.ACTIVE) {
+            this.stompClient.deactivate();
           }
-          this.connectState = false;
+          this.updateConnectionState({isConnected: false, isDataStreamActive: false});
           this.treeSelectedNode = [];
           this.switchValue = false;
           this.items = [];
         }
       }).catch(err => {
         this.$notify.error({title: "错误", content: err.message, closeBtn: true});
+        console.error(err)
       })
+    },
+    subscribeToDataTopic() {
+      if (this.stompClient.state === ActivationState.ACTIVE) {
+        this.stompClient.subscribe('/topic/opc/realtime', (message) => {
+          console.log('Received message: ', message.body);
+          const data = JSON.parse(message.body);
+          this.handleReceivedData(data);
+        })
+      } else {
+        this.$notify.error({title: "错误", content: "后端连接未建立，无法订阅主题！", closeBtn: true});
+      }
+    },
+    // 更新连接状态
+    updateConnectionState(newState) {
+      this.connectionState = {...this.connectionState, ...newState}
+    },
+    // 统一错误处理
+    handleError(title, message) {
+      this.$notify.error({title, content: message, closeBtn: true})
+      console.error(`${title}: ${message}`)
+    },
+
+    // 统一警告处理
+    handleWarning(title, message) {
+      this.$notify.warning({title, content: message, closeBtn: true})
     }
-  }
+  },
 }
 
 </script>

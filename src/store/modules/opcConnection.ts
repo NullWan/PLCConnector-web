@@ -36,10 +36,10 @@ const actions = {
     }
   },
 
-  async read({state}, readInfo) {
+  async add({state}, readInfo) {
     try {
       const res = await request.request({
-        url: '/opc/da/read',
+        url: '/opc/da/add',
         method: 'post',
         data: readInfo,
       });
@@ -51,10 +51,25 @@ const actions = {
       }
     }
   },
-  async start({state}) {
+  async remove({state}, readInfo) {
     try {
       const res = await request.request({
-        url: '/opc/da/start',
+        url: '/opc/da/remove',
+        method: 'post',
+        data: readInfo,
+      });
+      return res.data;
+    } catch (e) {
+      return {
+        code: 500,
+        msg: "连接出错，请重试！"
+      }
+    }
+  },
+  async start({state}, clientId) {
+    try {
+      const res = await request.request({
+        url: `/opc/da/start/${clientId}`,
         method: 'get',
       });
       return res.data;
@@ -69,6 +84,20 @@ const actions = {
     try {
       const res = await request.request({
         url: `/opc/da/stop/${clientId}`,
+        method: 'get',
+      });
+      return res.data;
+    } catch (e) {
+      return {
+        code: 500,
+        msg: "连接出错，请重试！"
+      }
+    }
+  },
+  async disconnect({state}, clientId) {
+    try {
+      const res = await request.request({
+        url: `/opc/da/disConnect/${clientId}`,
         method: 'get',
       });
       return res.data;
